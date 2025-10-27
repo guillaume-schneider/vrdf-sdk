@@ -4,21 +4,8 @@ import json
 import struct
 import numpy.linalg as LA
 import sys
-
-############################################
-# CONFIG UTILISATEUR
-############################################
-
-NIFTI_PATH = "brats_00012_separated-t2f.nii"
-MODE = "multi_label_channels"  # "labelmap" | "continuous" | "auto_overlay" | "multi_label_channels"
-
-RAW_OUT  = "volume.raw"
-META_OUT = "volume_meta.json"
-TF_OUT   = "transfer_function.json"
-
-# for auto_overlay
-AUTO_OVERLAY_NUM_CLUSTERS = 4
-AUTO_OVERLAY_MIN_ALPHA    = 0.4
+import argparse
+import os
 
 ############################################
 # FONCTIONS UTILITAIRES
@@ -39,7 +26,7 @@ def write_raw_xyzC_order(data, raw_path):
                     v = float(data[x, y, z])
                     f.write(struct.pack("<f", v))
 
-def save_meta(meta_path, shape_xyz, spacing_mm, affine, data_min, data_max, mode):
+def save_meta_dict(shape_xyz, spacing_mm, affine, data_min, data_max, mode, endianness):
     dimX, dimY, dimZ = shape_xyz
     meta = {
         "dim": [int(dimX), int(dimY), int(dimZ)],
@@ -48,51 +35,18 @@ def save_meta(meta_path, shape_xyz, spacing_mm, affine, data_min, data_max, mode
         "intensity_range": [float(data_min), float(data_max)],
         "affine": affine.tolist(),
         "mode": mode,
-        "endianness": sys.byteorder,
+        "endianness": endianness,
         "order": "x-fast,y-then,z-outer"
     }
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"[OK] Wrote {meta_path}")
+    return meta
+
+def write_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+    print(f"[OK] Wrote {path}")
 
 ##########################################################
-# MODE "labelmap"
-##########################################################
-
-def build_transfer_function_labelmap(seg_data):
-    labels_present = np.unique(seg_data).tolist()
-    print("Labels présents:", labels_present)
-
-    def default_rgba_for_label(lbl):
-        if lbl == 0:
-            return (0.0, 0.0, 0.0, 0.0)
-        if lbl == 1:
-            return (0.7, 0.0, 0.0, 0.4)
-        if lbl == 2:
-            return (0.3, 0.9, 0.3, 0.15)
-        if lbl == 4:
-            return (1.0, 0.5, 0.0, 0.6)
-
-        rng = np.random.default_rng(int(lbl) % 123457)
-        r,g,b = rng.uniform(0.3,1.0,3)
-        a     = 0.4
-        return (float(r), float(g), float(b), float(a))
-
-    entries = []
-    for lbl in labels_present:
-        rgba = default_rgba_for_label(int(lbl))
-        entries.append({
-            "label": float(lbl),
-            "color": [rgba[0], rgba[1], rgba[2]],
-            "alpha": rgba[3]
-        })
-    return {
-        "type": "labelmap",
-        "entries": entries
-    }
-
-##########################################################
-# MODE "continuous"
+# NORMALISATION / MODES
 ##########################################################
 
 def normalize_intensity_percentile(vol):
@@ -101,7 +55,11 @@ def normalize_intensity_percentile(vol):
     vol_n = np.clip(vol_n, 0, 1)
     return vol_n.astype(np.float32, copy=False), float(p1), float(p99)
 
-def build_transfer_function_continuous(vol_norm, p1, p99):
+##########################################################
+# TRANSFER FUNCTIONS
+##########################################################
+
+def build_transfer_function_continuous(vol_norm, p1, p99, user_tf=None):
     tf_curve = []
     for i in range(256):
         x = i / 255.0
@@ -149,9 +107,48 @@ def build_transfer_function_continuous(vol_norm, p1, p99):
         }
     }
 
-##########################################################
-# MODE "auto_overlay"
-##########################################################
+def build_transfer_function_labelmap(seg_data, user_tf=None):
+    labels_present = np.unique(seg_data).tolist()
+    print("Labels présents:", labels_present)
+
+    def default_rgba_for_label(lbl):
+        if lbl == 0:
+            return (0.0, 0.0, 0.0, 0.0)
+        if lbl == 1:
+            return (0.7, 0.0, 0.0, 0.4)
+        if lbl == 2:
+            return (0.3, 0.9, 0.3, 0.15)
+        if lbl == 4:
+            return (1.0, 0.5, 0.0, 0.6)
+        rng = np.random.default_rng(int(lbl) % 123457)
+        r,g,b = rng.uniform(0.3,1.0,3)
+        a     = 0.4
+        return (float(r), float(g), float(b), float(a))
+
+    entries = []
+    for lbl in labels_present:
+        if user_tf and "labels" in user_tf and str(lbl) in user_tf["labels"]:
+            spec = user_tf["labels"][str(lbl)]
+            color = spec.get("color",[1.0,1.0,1.0])
+            alpha = spec.get("alpha",0.5)
+            name  = spec.get("name", f"label_{lbl}")
+        else:
+            rgba = default_rgba_for_label(int(lbl))
+            color = [rgba[0], rgba[1], rgba[2]]
+            alpha = rgba[3]
+            name  = f"label_{lbl}"
+
+        entries.append({
+            "label": float(lbl),
+            "color": [float(color[0]), float(color[1]), float(color[2])],
+            "alpha": float(alpha),
+            "name":  name
+        })
+
+    return {
+        "type": "labelmap",
+        "entries": entries
+    }
 
 def cluster_overlay_to_labelmap(vol4d, n_clusters=4, alpha_default=0.4):
     from sklearn.cluster import KMeans
@@ -186,7 +183,8 @@ def cluster_overlay_to_labelmap(vol4d, n_clusters=4, alpha_default=0.4):
         cluster_rgba_entries.append({
             "label": float(cid),
             "color": [float(mean_col[0]), float(mean_col[1]), float(mean_col[2])],
-            "alpha": float(alpha)
+            "alpha": float(alpha),
+            "name": f"cluster_{cid}"
         })
 
     tf_json = {
@@ -197,27 +195,7 @@ def cluster_overlay_to_labelmap(vol4d, n_clusters=4, alpha_default=0.4):
 
     return labelmap_3d.astype(np.float32), tf_json
 
-##########################################################
-# MODE "multi_label_channels"
-##########################################################
-
-def fuse_multichannel_to_labelmap(vol4d):
-    """
-    vol4d shape: (X,Y,Z,L) uint8 ou float
-    Interprétation: chaque canal L = une classe.
-    Sortie:
-      labelmap (X,Y,Z) float32, avec:
-        0 = rien
-        1 = canal 0 actif
-        2 = canal 1 actif
-        3 = canal 2 actif
-        ...
-        L = canal L-1 actif
-      tf_json de type labelmap avec couleurs fixes par canal.
-    Règle en cas de chevauchement: on prend le canal avec l'intensité max.
-    (si tie, np.argmax prend le premier)
-    """
-
+def fuse_multichannel_to_labelmap(vol4d, user_tf=None):
     X, Y, Z, L = vol4d.shape
 
     winner_channel = np.argmax(vol4d, axis=3)
@@ -230,98 +208,185 @@ def fuse_multichannel_to_labelmap(vol4d):
     ).astype(np.float32)
 
     base_colors = [
-        (1.0, 0.0, 0.0),   
-        (0.0, 1.0, 0.0),   
-        (0.0, 0.0, 1.0),   
-        (1.0, 1.0, 0.0),   
-        (1.0, 0.0, 1.0),   
-        (0.0, 1.0, 1.0),   
-        (1.0, 0.5, 0.0),   
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (1.0, 1.0, 0.0),
+        (1.0, 0.0, 1.0),
+        (0.0, 1.0, 1.0),
+        (1.0, 0.5, 0.0),
         (0.6, 0.2, 0.8),
     ]
 
-    entries = []
-    entries.append({
-        "label": 0.0,
-        "color": [0.0, 0.0, 0.0],
-        "alpha": 0.0
-    })
+    # background override
+    bg_name  = "background"
+    bg_color = [0.0,0.0,0.0]
+    bg_alpha = 0.0
+    if user_tf and "channels" in user_tf and "0" in user_tf["channels"]:
+        spec0 = user_tf["channels"]["0"]
+        bg_name  = spec0.get("name", bg_name)
+        bg_color = spec0.get("color", bg_color)
+        bg_alpha = spec0.get("alpha", bg_alpha)
 
+    entries = [{
+        "label": 0.0,
+        "color": [float(bg_color[0]), float(bg_color[1]), float(bg_color[2])],
+        "alpha": float(bg_alpha),
+        "name":  bg_name
+    }]
+
+    channel_names_hint = []
     for cid in range(L):
         color = base_colors[cid % len(base_colors)]
+        alpha = 0.5
+        cname = f"channel_{cid}"
+
+        if user_tf and "channels" in user_tf and str(cid+1) in user_tf["channels"]:
+            spec = user_tf["channels"][str(cid+1)]
+            color = spec.get("color", list(color))
+            alpha = spec.get("alpha", alpha)
+            cname = spec.get("name", cname)
+
         entries.append({
             "label": float(cid+1),
-            "color": [color[0], color[1], color[2]],
-            "alpha": 0.5
+            "color": [float(color[0]), float(color[1]), float(color[2])],
+            "alpha": float(alpha),
+            "name":  cname
         })
+        channel_names_hint.append(cname)
 
     tf_json = {
         "type": "labelmap",
         "entries": entries,
         "origin": "multi_label_channels",
-        "channel_names_hint": [
-            f"channel_{i}" for i in range(L)
-        ]
+        "channel_names_hint": channel_names_hint
     }
 
     return labelmap, tf_json
 
 ##########################################################
-# PIPELINE PRINCIPAL
+# VRDF WRITER
 ##########################################################
 
-def main():
-    img = nib.load(NIFTI_PATH)
+def write_vrdf(vrdf_path, meta_dict, tf_dict, volume_array):
+    """
+    Ecrit le conteneur .vrdf :
+    [8 bytes magic ascii 'VRDF0001']
+    [8 bytes uint64 total_size_bytes]
+
+    Puis pour chaque bloc:
+      [8 bytes uint64 block_size_meta_json]
+      [meta_json_bytes...]
+      [8 bytes uint64 block_size_tf_json]
+      [tf_json_bytes...]
+      [8 bytes uint64 block_size_raw]
+      [raw_bytes...]
+
+    Tous les entiers encodés en little-endian.
+    """
+
+    meta_bytes = json.dumps(meta_dict, separators=(",",":")).encode("utf-8")
+    tf_bytes   = json.dumps(tf_dict, separators=(",",":")).encode("utf-8")
+
+    X,Y,Z = volume_array.shape
+    raw_buf = bytearray()
+    for z in range(Z):
+        for y in range(Y):
+            for x in range(X):
+                v = float(volume_array[x,y,z])
+                raw_buf += struct.pack("<f", v)
+    raw_bytes = bytes(raw_buf)
+
+    block_meta_len = len(meta_bytes)
+    block_tf_len   = len(tf_bytes)
+    block_raw_len  = len(raw_bytes)
+
+    total_size = (
+        16 +
+        8 + block_meta_len +
+        8 + block_tf_len +
+        8 + block_raw_len
+    )
+
+    with open(vrdf_path, "wb") as f:
+        # magic + version
+        f.write(b"VRDF0001")                          # 8 bytes
+        f.write(struct.pack("<Q", total_size))        # 8 bytes uint64
+
+        # META block
+        f.write(struct.pack("<Q", block_meta_len))    # length meta
+        f.write(meta_bytes)
+
+        # TF block
+        f.write(struct.pack("<Q", block_tf_len))      # length tf
+        f.write(tf_bytes)
+
+        # RAW block
+        f.write(struct.pack("<Q", block_raw_len))     # length raw
+        f.write(raw_bytes)
+
+    print(f"[OK] Wrote {vrdf_path}")
+    print(f"     total_size={total_size} bytes")
+    print(f"     meta={block_meta_len} bytes, tf={block_tf_len} bytes, raw={block_raw_len} bytes")
+
+##########################################################
+# PIPELINE
+##########################################################
+
+def run_pipeline(
+    nifti_path,
+    mode,
+    vrdf_out,
+    auto_overlay_num_clusters,
+    auto_overlay_min_alpha,
+    user_cfg,
+    debug_dump,
+    raw_out,
+    meta_out,
+    tf_out
+):
+    img = nib.load(nifti_path)
     vol_full = img.get_fdata(dtype=np.float32)
     affine = img.affine
     spacing_mm = compute_spacing_mm(affine)
 
     print(f"[INFO] Original volume shape: {vol_full.shape}")
-    print(f"[INFO] MODE: {MODE}")
+    print(f"[INFO] MODE: {mode}")
 
-    if MODE == "multi_label_channels":
-        #
-        # Cas multi-couches (X,Y,Z,L)
-        #
+    user_tf = None
+    if user_cfg is not None and "transfer_function" in user_cfg:
+        user_tf = user_cfg["transfer_function"]
+
+    if mode == "multi_label_channels":
         if vol_full.ndim != 4:
             raise ValueError("multi_label_channels attend un volume 4D (X,Y,Z,L).")
-        export_data, tf_json = fuse_multichannel_to_labelmap(vol_full)
+        export_data, tf_json = fuse_multichannel_to_labelmap(vol_full, user_tf=user_tf)
+        data_min = float(export_data.min())
+        data_max = float(export_data.max())
 
-        data_min = float(export_data.min())  # normalement 0
-        data_max = float(export_data.max())  # normalement L
-
-    elif MODE == "labelmap":
-        #
-        # Cas labelmap déjà fusionné voxel-wise (0,1,2,4,...)
-        #
+    elif mode == "labelmap":
         if vol_full.ndim == 4:
             print("[WARN] 4D volume detected, keeping only channel 0 for labelmap.")
             vol = vol_full[..., 0]
         else:
             vol = vol_full
         export_data = vol.astype(np.float32, copy=False)
-        tf_json = build_transfer_function_labelmap(export_data)
+        tf_json = build_transfer_function_labelmap(export_data, user_tf=user_tf)
         data_min = float(export_data.min())
         data_max = float(export_data.max())
 
-    elif MODE == "continuous":
-        #
-        # Cas intensité continue type IRM
-        #
+    elif mode == "continuous":
         if vol_full.ndim == 4:
             print("[WARN] 4D volume detected, keeping only channel 0 for continuous.")
             vol = vol_full[..., 0]
         else:
             vol = vol_full
         export_data, p1, p99 = normalize_intensity_percentile(vol)
-        tf_json = build_transfer_function_continuous(export_data, p1, p99)
+        tf_json = build_transfer_function_continuous(export_data, p1, p99, user_tf=user_tf)
         data_min = float(export_data.min())
         data_max = float(export_data.max())
 
-    elif MODE == "auto_overlay":
-        #
-        # Cas overlay RGB (X,Y,Z,3) qu'on clusterise
-        #
+    elif mode == "auto_overlay":
         if not (vol_full.ndim == 4 and vol_full.shape[3] == 3):
             print("[WARN] auto_overlay demandé mais volume != (X,Y,Z,3). Fallback continuous.")
             if vol_full.ndim == 4:
@@ -329,35 +394,36 @@ def main():
             else:
                 vol = vol_full
             export_data, p1, p99 = normalize_intensity_percentile(vol)
-            tf_json = build_transfer_function_continuous(export_data, p1, p99)
+            tf_json = build_transfer_function_continuous(export_data, p1, p99, user_tf=user_tf)
             data_min = float(export_data.min())
             data_max = float(export_data.max())
         else:
             export_data, tf_json = cluster_overlay_to_labelmap(
                 vol_full,
-                n_clusters=AUTO_OVERLAY_NUM_CLUSTERS,
-                alpha_default=AUTO_OVERLAY_MIN_ALPHA
+                n_clusters=auto_overlay_num_clusters,
+                alpha_default=auto_overlay_min_alpha
             )
             data_min = float(export_data.min())
             data_max = float(export_data.max())
     else:
         raise ValueError("MODE doit être 'labelmap', 'continuous', 'auto_overlay' ou 'multi_label_channels'.")
 
-    write_raw_xyzC_order(export_data, RAW_OUT)
-    print(f"[OK] Wrote {RAW_OUT}")
+    meta_dict = save_meta_dict(
+        export_data.shape,
+        spacing_mm,
+        affine,
+        data_min,
+        data_max,
+        mode,
+        sys.byteorder
+    )
 
-    dimX, dimY, dimZ = export_data.shape
-    save_meta(META_OUT,
-              (dimX, dimY, dimZ),
-              spacing_mm,
-              affine,
-              data_min,
-              data_max,
-              MODE)
+    write_vrdf(vrdf_out, meta_dict, tf_json, export_data)
 
-    with open(TF_OUT, "w") as f:
-        json.dump(tf_json, f, indent=2)
-    print(f"[OK] Wrote {TF_OUT}")
+    if debug_dump:
+        write_raw_xyzC_order(export_data, raw_out)
+        write_json(meta_out, meta_dict)
+        write_json(tf_out, tf_json)
 
     print("----- SUMMARY -----")
     print("Shape:", export_data.shape)
@@ -365,7 +431,74 @@ def main():
     print("min/max:", data_min, data_max)
     print("TF mode:", tf_json.get("type", "unknown"))
     print("TF origin:", tf_json.get("origin", "default"))
+    if "entries" in tf_json:
+        for e in tf_json["entries"]:
+            lbl = e.get("label")
+            nm  = e.get("name", None)
+            if nm is not None:
+                print(f"  label {lbl} -> {nm}")
     print("-------------------")
+
+############################################
+# CLI
+############################################
+
+def load_user_config(path):
+    if path is None:
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Convertit un NIfTI en .vrdf (volume+meta+TF). Optionnellement dump les fichiers séparés."
+    )
+
+    p.add_argument("--nifti", required=True, help="Chemin vers le .nii/.nii.gz d'entrée")
+    p.add_argument("--mode", required=True,
+                   choices=["labelmap","continuous","auto_overlay","multi_label_channels"],
+                   help="Mode d'interprétation du volume")
+
+    p.add_argument("--vrdf-out", default="scene.vrdf",
+                   help="Chemin du fichier packagé .vrdf (défaut: scene.vrdf)")
+
+    p.add_argument("--config", default=None,
+                   help="Chemin vers un JSON de config utilisateur (mapping labels/canaux, couleurs, noms...)")
+
+    p.add_argument("--num-clusters", type=int, default=4,
+                   help="[auto_overlay] nombre de clusters KMeans")
+    p.add_argument("--min-alpha", type=float, default=0.4,
+                   help="[auto_overlay] alpha par défaut des clusters")
+
+    p.add_argument("--debug-dump", action="store_true",
+                   help="Si présent: écrit aussi volume.raw, volume_meta.json, transfer_function.json")
+
+    p.add_argument("--raw-out", default="volume.raw",
+                   help="[debug only] Chemin du .raw de sortie")
+    p.add_argument("--meta-out", default="volume_meta.json",
+                   help="[debug only] Chemin du metadata JSON")
+    p.add_argument("--tf-out",   default="transfer_function.json",
+                   help="[debug only] Chemin du transfer function JSON")
+
+    args = p.parse_args()
+    return args
+
+def main():
+    args = parse_args()
+    user_cfg = load_user_config(args.config)
+
+    run_pipeline(
+        nifti_path=args.nifti,
+        mode=args.mode,
+        vrdf_out=args.vrdf_out,
+        auto_overlay_num_clusters=args.num_clusters,
+        auto_overlay_min_alpha=args.min_alpha,
+        user_cfg=user_cfg,
+        debug_dump=args.debug_dump,
+        raw_out=args.raw_out,
+        meta_out=args.meta_out,
+        tf_out=args.tf_out
+    )
 
 if __name__ == "__main__":
     main()

@@ -10,29 +10,29 @@
 
 ## Overview
 
-**VRDF** (Volume Rendering Data Format) is a lightweight binary container designed for **3D volumetric datasets** used in scientific and medical visualization.  
-It encapsulates everything needed for **direct volume rendering (DVR)** in a single, portable file.
+**VRDF** (Volume Rendering Data Format) is a compact, open binary container for **3D volumetric datasets** used in medical, scientific, and industrial visualization.  
+It bundles **voxels**, **metadata**, and **transfer functions** into a single portable file optimized for **real-time volume rendering**.
 
 A `.vrdf` file contains:
 
-- **Voxel data** (`float32`, x-fastest order)
-- **Metadata** (dimensions, spacing, affine transform)
-- **Transfer function** (continuous or labelmap)
+- **Voxel data** (`float32`, X-fastest order)  
+- **Metadata** (dimensions, spacing, affine matrix)  
+- **Transfer function** (continuous or labelmap)  
 - **Normalization info** (`p1`, `p99`, etc.)
 
-This repository — **`vrdf-sdk`** — provides the **official SDK** for reading, writing, and visualizing `.vrdf` files across platforms (Python ↔ Unity).
+The **VRDF-SDK** provides official tools for **encoding**, **decoding**, and **rendering** across platforms (Python ↔ Unity).
 
 ---
 
 ## Features
 
-- Unified format for volumetric datasets (MRI, CT, segmentations, simulations)
-- Python encoder (convert from NIfTI, MHD, RAW…)
-- Unity/C# decoder for real-time GPU raymarching
-- Supports both **continuous** and **labelmap** transfer functions
-- Self-contained: voxels + metadata + LUT in one file
-- Cross-platform (Linux, Windows, macOS)
-- Extensible and open-spec
+- Unified container for 3D volumetric datasets (`.vrdf`)
+- Python encoder for NIfTI, MHD, RAW, etc.
+- Unity runtime with GPU raymarching
+- Transfer function customization via JSON config
+- Supports **continuous**, **labelmap**, and **multi-channel** volumes
+- Self-contained: voxels + metadata + LUT
+- Cross-platform (Windows, Linux, macOS)
 
 ---
 
@@ -41,25 +41,19 @@ This repository — **`vrdf-sdk`** — provides the **official SDK** for reading
 ```
 vrdf-sdk/
 │
-├── spec/                 # Format specification
-│   └── vrdf1.0.md
-│
-├── python/               # Encoder and CLI tools
-│   ├── encode_vrdf.py
-│   ├── vrdf_writer.py
-│   ├── requirements.txt
+├── python/               # Encoder, decoder, CLI, examples
+│   ├── encode.py        # Encode NIfTI -> .vrdf
+│   ├── read_vrdf.py           # Inspect .vrdf files
+│   ├── pyproject.toml
 │   └── examples/
+│       ├── config_custom_colors.json
+│       └── brain_demo.nii.gz
 │
-├── unity/                # Unity runtime (loader + DVR shader)
+├── unity/                # Unity runtime (C# + shaders)
 │   ├── Scripts/
 │   │   └── VolumeVRDFLoader.cs
 │   ├── Shaders/
 │   │   └── VolumeDVR.shader
-│   └── DemoScene.unity
-│
-├── examples/             # Demo datasets
-│   ├── brain_tumor/
-│   └── ct_abdomen/
 │
 └── README.md
 ```
@@ -68,117 +62,154 @@ vrdf-sdk/
 
 ## Getting Started
 
-### Encode a `.vrdf` file (Python)
-
-Install dependencies:
+### 1️. Install dependencies
 
 ```bash
-pip install nibabel numpy
+pip install nibabel numpy scikit-learn
 ```
-
-Convert a NIfTI file into `.vrdf`:
-
-```bash
-python encode_vrdf.py   --input BraTS-GLI-00022-001-seg.nii.gz   --mode labelmap   --output volume.vrdf
-```
-
-Options:
-- `--mode continuous` → raw MRI/CT data  
-- `--mode labelmap` → segmentation mask  
-- `--isotropic` → resample to isotropic voxels  
-
-This produces a **single `.vrdf` file** that includes voxel data, metadata, and a color transfer function.
 
 ---
 
-### Decode and visualize (Unity)
+### 2️. Encode a `.vrdf` file from a NIfTI
 
-1. Copy your `.vrdf` file into:  
-   `Assets/StreamingAssets/`
+```bash
+python encode.py   --nifti brats_00012_separated-t2f.nii   --mode multi_label_channels   --config config_custom_colors.json   --vrdf-out brain_scene.vrdf
+```
+
+This produces:
+- `volume.raw` — raw voxel data  
+- `volume_meta.json` — metadata  
+- `transfer_function.json` — transfer function (colors, alpha)  
+- `brain_scene.vrdf` — ✅ **single packaged file** (all-in-one)
+
+---
+
+### 3️. `.vrdf` File Structure
+
+Each `.vrdf` file is binary but simple to parse.  
+All integers are stored as **little-endian unsigned 64-bit** (`<Q`).
+
+| Section | Description | Content |
+|----------|--------------|----------|
+| **Header** | Magic `VRDF0001` + total file size | 16 bytes |
+| **Meta JSON block** | Metadata (`dim`, `spacing`, `affine`, etc.) | UTF-8 JSON |
+| **Transfer Function block** | Color mapping (`type`, `entries`, etc.) | UTF-8 JSON |
+| **Voxel block** | Volume data (`float32`) | `dimX * dimY * dimZ * 4` bytes |
+
+Binary layout:
+
+```
+[8B magic][8B total_size]
+[8B meta_len][meta_json...]
+[8B tf_len][tf_json...]
+[8B raw_len][raw_bytes...]
+```
+
+---
+
+### 4️Example Transfer Function Config
+
+#### `config_custom_colors.json`
+```json
+{
+  "transfer_function": {
+    "labels": {
+      "0": {"name": "background", "color": [0.0, 0.0, 0.0], "alpha": 0.0},
+      "1": {"name": "tissue_gray", "color": [0.8, 0.8, 0.8], "alpha": 0.1},
+      "2": {"name": "tissue_green", "color": [0.0, 1.0, 0.0], "alpha": 0.4},
+      "3": {"name": "tissue_blue", "color": [0.0, 0.0, 1.0], "alpha": 0.5},
+      "4": {"name": "tissue_yellow", "color": [1.0, 1.0, 0.0], "alpha": 1.0}
+    }
+  }
+}
+```
+
+You can use the same config for both `--mode labelmap` and `--mode multi_label_channels`.
+
+---
+
+### 5️Inspect a `.vrdf` file (Python)
+
+Use the provided tool:
+
+```bash
+python read_vrdf.py brain_scene.vrdf
+```
+
+It prints:
+
+```
+[OK] Parsed brain_scene.vrdf
+  Magic: VRDF0001
+  Total size: 247.5 MB
+  Volume: 240×240×155
+  Mode: multi_label_channels
+  Labels:
+    0 → background
+    1 → tissue_gray
+    2 → tissue_green
+    3 → tissue_blue
+    4 → tissue_yellow
+```
+
+You can also visualize a slice if `matplotlib` is installed.
+
+---
+
+### 6️Load and Render in Unity
+
+1. Place your `.vrdf` file in:
+   ```
+   Assets/StreamingAssets/
+   ```
 2. Add:
-   - `VolumeVRDFLoader.cs` script
-   - `VolumeDVR.shader` material
-3. Assign your file name in the inspector.
+   - `VolumeVRDFLoader.cs`
+   - `VolumeDVR.shader`
+3. Assign the filename in the inspector.
 
 Unity automatically:
-- Parses the metadata and LUT from the embedded JSON  
-- Builds a 3D Texture + 1D Transfer LUT  
-- Renders the volume via GPU raymarching  
-
----
-
-## `.vrdf` File Structure
-
-| Section | Description | Size |
-|----------|--------------|------|
-| **Header** | Magic `VRDF1.0`, JSON length, voxel dtype | 40 bytes |
-| **JSON Block** | Metadata + Transfer Function (UTF-8) | variable |
-| **Voxel Block** | Raw float32 data (x-fastest) | `dimX * dimY * dimZ * 4` bytes |
-
-Each `.vrdf` file is **self-contained**, platform-independent, and streamable.
-
----
-
-## Transfer Functions
-
-### Labelmap mode (for segmentation masks)
-```json
-"tf": {
-  "type": "labelmap",
-  "entries": [
-    {"label":0, "color":[0,0,0], "alpha":0.0},
-    {"label":1, "color":[0.9,0.3,0.3], "alpha":0.4},
-    {"label":2, "color":[0.3,0.9,0.3], "alpha":0.3},
-    {"label":4, "color":[1.0,0.8,0.0], "alpha":0.5}
-  ]
-}
-```
-
-### Continuous mode (for CT/MRI)
-```json
-"tf": {
-  "type": "continuous",
-  "curve": [
-    {"x":0.0, "color":[0,0,0.3], "alpha":0.0},
-    {"x":0.5, "color":[1,0.6,0.2], "alpha":0.3},
-    {"x":1.0, "color":[1,1,1], "alpha":0.8}
-  ]
-}
-```
+- Parses metadata and TF JSON  
+- Builds a `3D Texture` from voxels  
+- Creates a `1D LUT` from TF  
+- Performs **real-time raymarching**
 
 ---
 
 ## Example Use Cases
 
-- **Medical imaging** (MRI/CT visualization)
-- **Segmentation rendering** (BraTS, organ atlases, AI outputs)
-- **Scientific data exploration**
-- **Volumetric simulation results**
-- **Educational or serious game content**
+- MRI/CT visualization  
+- Medical segmentation rendering (BraTS, AI masks)  
+- Scientific simulation data  
+- Educational & serious games  
+- 🧑Research visualization pipelines  
 
 ---
 
 ## Roadmap
 
+- [x] `.vrdf` single-file container  
+- [x] Python encoder (NIfTI → VRDF)  
+- [x] Labelmap / Continuous / Multi-channel support  
+- [x] Unity runtime decoder  
 - [ ] C++ reference parser  
-- [ ] CLI tools (`vrdf inspect`, `vrdf convert`)  
 - [ ] WebGL/WebGPU viewer  
 - [ ] ZSTD/LZ4 compression for voxel blocks  
-- [ ] Progressive streaming for large datasets  
+- [ ] Streaming support for large datasets  
 
 ---
 
 ## Contributing
 
-Pull requests and issue reports are welcome!  
+Pull requests and issues are welcome!  
 You can contribute by:
-- Improving the Python or Unity SDKs
-- Proposing new LUT presets
-- Extending the `.vrdf` specification
+- Improving the Python or Unity SDKs  
+- Adding new LUT presets  
+- Extending the `.vrdf` format (compression, streaming, metadata fields)
 
 ---
 
 ## License
 
 **Apache 2.0 License**  
-© 2025 Guillaume Schneider and contributors.
+© 2025 Guillaume Schneider and contributors.  
+Use freely for research, education, or commercial visualization.
