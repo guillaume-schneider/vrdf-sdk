@@ -1,174 +1,119 @@
-#!/usr/bin/env python3
-import sys
 import struct
 import json
 import numpy as np
 
-def read_uint64_le(f):
-    """Lit un uint64 little-endian depuis le fichier f."""
-    data = f.read(8)
-    if len(data) != 8:
-        raise IOError("Unexpected EOF while reading uint64.")
-    return struct.unpack("<Q", data)[0]
+MAGIC = b"VRDF0001"
 
-def load_vrdf(path):
-    """
-    Charge un fichier .vrdf et renvoie:
-    meta_dict, tf_dict, volume_np
-    """
+class VRDFVolume:
+    def __init__(self):
+        self.meta = None           # dict
+        self.tf = None             # dict
+        self.data = None           # np.ndarray (float32)
+        self.shape = None          # (X,Y,Z)
+        self.mode = None           # labelmap / continuous / etc.
+        self.spacing = None        # [sx,sy,sz]
+        self.affine = None         # 4x4
+        self.dtype = None
+        self.intensity_range = None
+
+    def summary(self):
+        print(f"[VRDF] mode={self.mode} shape={self.shape} dtype={self.dtype}")
+        if self.spacing is not None:
+            print(f"       spacing_mm={self.spacing}")
+        if self.intensity_range is not None:
+            print(f"       range={self.intensity_range}")
+        if self.tf is not None:
+            tf_type = self.tf.get('type', 'unknown')
+            print(f"       TF type={tf_type}, entries={len(self.tf.get('entries', []))}, curve={len(self.tf.get('curve', []))}")
+
+
+def read_uint64_le(f):
+    b = f.read(8)
+    if len(b) != 8:
+        raise EOFError("Unexpected EOF while reading uint64.")
+    return struct.unpack("<Q", b)[0]
+
+
+def read_vrdf(path):
+    """Lit un fichier .vrdf ou .vrdfw et renvoie un VRDFVolume"""
+    vol = VRDFVolume()
+
     with open(path, "rb") as f:
         magic = f.read(8)
-        if magic != b"VRDF0001":
-            raise ValueError(f"Bad magic header {magic!r}, expected b'VRDF0001'")
-        total_size = read_uint64_le(f)
+        if magic != MAGIC:
+            raise ValueError(f"Bad magic {magic}, expected {MAGIC}")
 
+        total_size = read_uint64_le(f)
         meta_len = read_uint64_le(f)
-        meta_bytes = f.read(meta_len)
-        if len(meta_bytes) != meta_len:
-            raise IOError("Unexpected EOF while reading meta block.")
-        meta_dict = json.loads(meta_bytes.decode("utf-8"))
+        meta_json = f.read(meta_len).decode("utf-8")
 
         tf_len = read_uint64_le(f)
-        tf_bytes = f.read(tf_len)
-        if len(tf_bytes) != tf_len:
-            raise IOError("Unexpected EOF while reading TF block.")
-        tf_dict = json.loads(tf_bytes.decode("utf-8"))
+        tf_json = f.read(tf_len).decode("utf-8")
 
         raw_len = read_uint64_le(f)
         raw_bytes = f.read(raw_len)
-        if len(raw_bytes) != raw_len:
-            raise IOError("Unexpected EOF while reading RAW block.")
 
-    dimX, dimY, dimZ = meta_dict["dim"]
-    expected_raw_len = dimX * dimY * dimZ * 4  # float32
-    if raw_len != expected_raw_len:
-        raise ValueError(
-            f"RAW length mismatch: header={raw_len}B vs expected {expected_raw_len}B "
-            f"for volume {dimX}x{dimY}x{dimZ} float32"
-        )
+    meta = json.loads(meta_json)
+    tf = json.loads(tf_json)
 
-    volume_np = np.frombuffer(raw_bytes, dtype="<f4")  # little-endian float32
-    volume_np = volume_np.reshape((dimX, dimY, dimZ), order="C")
-
-    return {
-        "magic": magic.decode("ascii", errors="replace"),
-        "total_size": total_size,
-        "meta": meta_dict,
-        "tf": tf_dict,
-        "volume": volume_np
-    }
-
-def summarize(vrdf_obj):
-    """
-    Affiche un résumé humainement lisible de ce qu'on a chargé.
-    """
-    meta = vrdf_obj["meta"]
-    tf   = vrdf_obj["tf"]
-    vol  = vrdf_obj["volume"]
-
-    dimX, dimY, dimZ = meta["dim"]
-    spacing = meta.get("spacing_mm", None)
+    dim = meta.get("dim", [1,1,1])
+    sx, sy, sz = meta.get("spacing_mm", [1.0,1.0,1.0])
+    dtype = meta.get("dtype", "float32")
     mode = meta.get("mode", "unknown")
-    intensity_range = meta.get("intensity_range", None)
+    intensity_range = meta.get("intensity_range", [0,1])
+    affine = np.array(meta.get("affine", np.eye(4))).reshape((4,4))
 
-    print("[OK] Parsed VRDF")
-    print(f"  Magic:        {vrdf_obj['magic']}")
-    print(f"  Total size:   {bytes_to_human(vrdf_obj['total_size'])}")
-    print(f"  Volume shape: {dimX}×{dimY}×{dimZ}  (np shape={vol.shape}, dtype={vol.dtype})")
-    print(f"  Mode:         {mode}")
-    print(f"  Spacing (mm): {spacing}")
-    print(f"  Intensity:    {intensity_range}")
-    print(f"  Endianness:   {meta.get('endianness','?')} (recorded)")
-    print(f"  Order:        {meta.get('order','?')}")
+    dimX, dimY, dimZ = [int(x) for x in dim]
+    expected_bytes = dimX * dimY * dimZ * 4
+    if len(raw_bytes) != expected_bytes:
+        raise ValueError(f"RAW size mismatch: got {len(raw_bytes)}, expected {expected_bytes}")
 
+    data = np.frombuffer(raw_bytes, dtype=np.float32)
+    data = data.reshape((dimX, dimY, dimZ), order="C")
+
+    vol.meta = meta
+    vol.tf = tf
+    vol.data = data
+    vol.shape = (dimX, dimY, dimZ)
+    vol.mode = mode
+    vol.spacing = [sx, sy, sz]
+    vol.affine = affine
+    vol.dtype = dtype
+    vol.intensity_range = intensity_range
+
+    return vol
+
+
+def dump_tf_summary(tf):
+    """Affiche un résumé simple de la TF"""
     tf_type = tf.get("type", "unknown")
-    print(f"  TF Type:      {tf_type}")
-    origin = tf.get("origin", None)
-    if origin:
-        print(f"  TF Origin:    {origin}")
+    print(f"TF type: {tf_type}")
 
     if tf_type == "labelmap":
-        print("  Labels:")
-        for entry in tf.get("entries", []):
-            lbl   = entry.get("label")
-            name  = entry.get("name", None)
-            color = entry.get("color")
-            alpha = entry.get("alpha")
-            if name is None:
-                name = f"label_{lbl}"
-            print(f"    {lbl} → {name}  color={color} alpha={alpha}")
-
-    if tf_type == "continuous":
+        entries = tf.get("entries", [])
+        for e in entries:
+            print(f"  label={e['label']:3.0f}  name={e.get('name','')}  "
+                  f"color={e['color']}  alpha={e['alpha']:.2f}")
+    elif tf_type == "continuous":
         curve = tf.get("curve", [])
-        print(f"  Curve keypoints (sample):")
-        for i, pt in enumerate(curve[0:5]):
-            print(f"    x={pt['x']:.3f} color={pt['color']} alpha={pt['alpha']:.3f}")
-        if len(curve) > 5:
-            last = curve[-1]
-            print(f"    ...")
-            print(f"    x={last['x']:.3f} color={last['color']} alpha={last['alpha']:.3f}")
+        print(f"  {len(curve)} points in curve.")
+        if curve:
+            print("  First:", curve[0])
+            print("  Mid:", curve[len(curve)//2])
+            print("  Last:", curve[-1])
+    else:
+        print(json.dumps(tf, indent=2))
 
-def bytes_to_human(n):
-    """
-    Transforme une taille en bytes en string lisible genre 247.5 MB.
-    """
-    units = ["B","KB","MB","GB","TB"]
-    step = 1024.0
-    x = float(n)
-    for u in units:
-        if x < step:
-            return f"{x:.1f} {u}"
-        x /= step
-    return f"{x:.1f} PB"
-
-def show_slice(volume_np, z_index):
-    """
-    Affiche une coupe Z en utilisant matplotlib (si dispo).
-    Pas de LUT fancy ici, c'est juste debug.
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[WARN] matplotlib non disponible, impossible d'afficher la coupe.")
-        return
-
-    dimZ = volume_np.shape[2]
-    if z_index < 0 or z_index >= dimZ:
-        print(f"[WARN] z_index {z_index} hors limites [0,{dimZ-1}]")
-        return
-
-    slice_2d = volume_np[:, :, z_index].T
-    plt.imshow(slice_2d, origin="lower")
-    plt.title(f"Z slice {z_index}")
-    plt.colorbar()
-    plt.show()
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print(f"  {sys.argv[0]} file.vrdf [--show-slice Z]")
-        sys.exit(1)
-
-    vrdf_path = sys.argv[1]
-
-    # parse optional flag --show-slice
-    z_index_to_show = None
-    if "--show-slice" in sys.argv:
-        idx = sys.argv.index("--show-slice")
-        if idx+1 >= len(sys.argv):
-            print("Erreur: --show-slice attend un index Z")
-            sys.exit(1)
-        try:
-            z_index_to_show = int(sys.argv[idx+1])
-        except ValueError:
-            print("Erreur: --show-slice doit être un entier.")
-            sys.exit(1)
-
-    vrdf_obj = load_vrdf(vrdf_path)
-    summarize(vrdf_obj)
-
-    if z_index_to_show is not None:
-        show_slice(vrdf_obj["volume"], z_index_to_show)
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python vrdf_reader.py <path_to_vrdf>")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    vrdf = read_vrdf(path)
+    vrdf.summary()
+    dump_tf_summary(vrdf.tf)
+
+    print(f"\n[DATA] voxel min={vrdf.data.min():.4f}, max={vrdf.data.max():.4f}, mean={vrdf.data.mean():.4f}")

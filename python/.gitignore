@@ -7,6 +7,10 @@ wheels/
 *.egg-info
 
 config_custom_colors.json
+*.nii.gz
+*.nii
+*.vrdf
+*.vrdfw
 
 # Virtual environments
 .venv

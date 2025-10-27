@@ -10,201 +10,336 @@
 
 ## Overview
 
-**VRDF** (Volume Rendering Data Format) is a compact, open binary container for **3D volumetric datasets** used in medical, scientific, and industrial visualization.  
-It bundles **voxels**, **metadata**, and **transfer functions** into a single portable file optimized for **real-time volume rendering**.
+**VRDF (Volume Rendering Data Format)** is a compact binary container for 3D medical or scientific volumes, designed for **real-time volume rendering** (raymarching / DVR).
 
-A `.vrdf` file contains:
+Each `.vrdf` file contains:
 
-- **Voxel data** (`float32`, X-fastest order)  
-- **Metadata** (dimensions, spacing, affine matrix)  
-- **Transfer function** (continuous or labelmap)  
-- **Normalization info** (`p1`, `p99`, etc.)
+- **Voxel data** (`float32`)  
+  - Memory order: `x-fast`, then `y`, then `z` (GPU scanline-friendly)
+- **Metadata**
+  - Dimensions (`dimX`, `dimY`, `dimZ`)
+  - Voxel spacing in millimeters (`spacing_mm`)
+  - 4×4 affine matrix (voxel→world, scanner alignment)
+  - Intensity min / max range
+  - Interpretation mode (continuous, labelmap, etc.)
+- **Transfer function (TF)**  
+  - Either a continuous LUT (intensity → color/alpha)
+  - Or a labelmap LUT (label → color/alpha/human name)
+- **Normalization info** (e.g. percentiles p1/p99)
+- (Optional) channel semantics if multi-channel data
 
-The **VRDF-SDK** provides official tools for **encoding**, **decoding**, and **rendering** across platforms (Python ↔ Unity).
+> Goal: one single self-contained file, readable in both **Python** and **Unity**, without separate `.raw`, `.json`, or `.lut` files.
 
 ---
 
-## Features
+## Why it’s useful
 
-- Unified container for 3D volumetric datasets (`.vrdf`)
-- Python encoder for NIfTI, MHD, RAW, etc.
-- Unity runtime with GPU raymarching
-- Transfer function customization via JSON config
-- Supports **continuous**, **labelmap**, and **multi-channel** volumes
-- Self-contained: voxels + metadata + LUT
-- Cross-platform (Windows, Linux, macOS)
+- Avoids the usual “NIfTI + mask + colors.txt + custom alpha script” nightmare.  
+- Enables instant GPU raymarching visualization in Unity.  
+- Encapsulates both continuous anatomy (MRI/CT) and discrete segmentations (AI masks, tumor maps).
+
+---
+
+## Core Features
+
+### Self-contained container
+- Voxels + metadata + transfer function stored in a single binary `.vrdf` file.
+
+### Python Encoder
+- `encode.py` converts NIfTI / 3D or 4D volumes → `.vrdf`
+- Supports:
+  - Single **fused file** (recommended)
+  - Or multiple **legacy** specialized files
+
+### Unity Runtime (C# + URP Shader)
+- Loads `.vrdf` files directly
+- Automatically reconstructs GPU `Texture3D` objects
+- Builds LUTs (1D `Texture2D`) from the embedded TF
+- Feeds data into the **raymarching shader** (`VolumeDVR.shader`)
+- Handles transparency, label masking, and weight modulation at runtime
+
+### Supported Data Types
+- **continuous** — anatomical intensity (MRI/CT)
+- **labelmap** — discrete segmentation (organs, tissues, lesions)
+- **labelmap_weighted** — segmentation + confidence map per voxel
+- **multi-overlay** — multiple overlay channels (edema, necrosis, etc.)
+- **4D → split** — temporal or multi-channel volumes exported as multiple `.vrdf`
+
+### Customization
+- Simple JSON config for color, alpha, and name per label
+- Optional Unity UI (via `VolumeDVR`) for per-class visibility, transparency, recoloring
+
+### Cross-platform
+- Python (Windows / Linux / macOS)
+- Unity runtime (Windows / Linux / macOS builds)
+- No proprietary dependencies
 
 ---
 
 ## Repository Structure
 
-```
+```text
 vrdf-sdk/
 │
-├── python/               # Encoder, decoder, CLI, examples
-│   ├── encode.py        # Encode NIfTI -> .vrdf
-│   ├── read_vrdf.py           # Inspect .vrdf files
+├── python/
+│   ├── encode.py              # CLI: NIfTI -> VRDF
+│   ├── read_vrdf.py           # Inspect/debug a .vrdf file
 │   ├── pyproject.toml
 │   └── examples/
 │       ├── config_custom_colors.json
 │       └── brain_demo.nii.gz
 │
-├── unity/                # Unity runtime (C# + shaders)
+├── unity/
 │   ├── Scripts/
-│   │   └── VolumeVRDFLoader.cs
+│   │   ├── VRDFLoader.cs      # Binary parser for .vrdf, builds GPU textures
+│   │   └── VolumeDVR.cs       # Runtime component, shader setup, label UI
 │   ├── Shaders/
-│   │   └── VolumeDVR.shader
+│   │   └── VolumeDVR.shader   # Raymarching with weighted rendering
 │
 └── README.md
 ```
 
 ---
 
-## Getting Started
+## Export Modes (Python Side)
 
-### 1️. Install dependencies
+The script `encode.py` accepts the `--mode` argument to define how to interpret and package a volume.
 
+### 1. `labelmap`
+- Input: discrete 3D volume (0 = background, 1 = tissue A, 2 = lesion B, …)
+- Output:
+  - `.vrdf` with `meta.mode = "labelmap"`
+  - TF type `"labelmap"` = `(label → [r,g,b], alpha, name)` list
+- Unity:
+  - Per-class rendering (no interpolation)
+  - Embedded per-label LUT
+
+### 2. `continuous4d`
+- Input: continuous 3D or 4D intensity volume (MRI, CT, PET, …)
+  - If 4D → each timepoint exported separately: `..._t00.vrdf`, `..._t01.vrdf`, etc.
+- Output:
+  - Percentile normalization (p1/p99 → [0..1])
+  - `meta.mode = "continuous"`
+  - TF `"continuous"` = intensity → RGBA/alpha curve
+- Unity:
+  - Anatomical grayscale/soft shading rendering
+
+### 3. `labelmap_weighted4d`
+Input: 4D `(X,Y,Z,C)` volume, each channel `C` representing a region of interest (e.g. BraTS components: enhancement, edema, necrosis).
+
+Automatically computes:
+- Majority label per voxel (argmax across channels)
+- Weight = normalized intensity (0–1)
+
+Two export strategies:
+
+#### a) Fused mode (default, recommended)
+- Produces **one file**: `scene_lw.vrdf`
+- For each voxel: two interleaved float32 values → `[label, weight01]`
+- Metadata:
+  - `meta.mode = "anatomy_label_weighted"`
+  - `meta.channels = 2`
+  - `meta.channel_meaning = ["labelmap","weight01"]`
+- TF: `"labelmap"` type (color, alpha, name per class)
+- Unity runtime:
+  - Builds two `Texture3D` objects:
+    - `_VolumeTexLabels` (point sampling)
+    - `_VolumeTexWeights` (bilinear sampling)
+  - `_VolumeTexWeights` modulates opacity → **weighted tumor rendering**
+
+#### b) Split mode (`--split-weight`)
+- Produces **two files**:
+  - `scene_labels.vrdf` (`mode="anatomy_label"`)
+  - `scene_weights.vrdf` (`mode="activity_weight"`)
+- Unity still supports this legacy format.
+
+### 4. `multi_overlay4d`
+- Input: 4D `(X,Y,Z,C)` volume where each channel is an independent structure (Enhancing, Core, Edema, etc.)
+- Output:
+  - One `.vrdf` per channel (`scene_ch0.vrdf`, `scene_ch1.vrdf`, …)
+  - Each with a simple `"continuous"` TF
+- Unity:
+  - Each overlay can be toggled independently
+
+---
+
+## Example Exports
+
+### Simple labelmap with custom colors
 ```bash
-pip install nibabel numpy scikit-learn
+python encode.py --nifti brain_segmentation.nii.gz --mode labelmap --config examples/config_custom_colors.json --vrdf-out brain_labels.vrdf
 ```
 
----
-
-### 2️. Encode a `.vrdf` file from a NIfTI
-
+### Weighted tumor (single fused file)
 ```bash
-python encode.py   --nifti brats_00012_separated-t2f.nii   --mode multi_label_channels   --config config_custom_colors.json   --vrdf-out brain_scene.vrdf
+python encode.py --nifti brats_case_42_multichannel.nii.gz --mode labelmap_weighted4d --vrdf-out scene_lw.vrdf
 ```
 
-This produces:
-- `volume.raw` — raw voxel data  
-- `volume_meta.json` — metadata  
-- `transfer_function.json` — transfer function (colors, alpha)  
-- `brain_scene.vrdf` — ✅ **single packaged file** (all-in-one)
-
----
-
-### 3️. `.vrdf` File Structure
-
-Each `.vrdf` file is binary but simple to parse.  
-All integers are stored as **little-endian unsigned 64-bit** (`<Q`).
-
-| Section | Description | Content |
-|----------|--------------|----------|
-| **Header** | Magic `VRDF0001` + total file size | 16 bytes |
-| **Meta JSON block** | Metadata (`dim`, `spacing`, `affine`, etc.) | UTF-8 JSON |
-| **Transfer Function block** | Color mapping (`type`, `entries`, etc.) | UTF-8 JSON |
-| **Voxel block** | Volume data (`float32`) | `dimX * dimY * dimZ * 4` bytes |
-
-Binary layout:
-
-```
-[8B magic][8B total_size]
-[8B meta_len][meta_json...]
-[8B tf_len][tf_json...]
-[8B raw_len][raw_bytes...]
+### Weighted tumor (split legacy version)
+```bash
+python encode.py --nifti brats_case_42_multichannel.nii.gz --mode labelmap_weighted4d --split-weight --vrdf-out scene.vrdf
+# => scene_labels.vrdf + scene_weights.vrdf
 ```
 
 ---
 
-### 4️Example Transfer Function Config
+## Binary Layout
 
-#### `config_custom_colors.json`
+All `.vrdf` files share a consistent little-endian layout:
+
+```text
+[8 bytes]    "VRDF0001"
+[8 bytes]    total_size (uint64)
+
+[8 bytes]    meta_len (uint64)
+[meta_len]   meta_json (UTF-8)
+
+[8 bytes]    tf_len (uint64)
+[tf_len]     tf_json (UTF-8)
+
+[8 bytes]    raw_len (uint64)
+[raw_len]    raw_bytes (float32 data)
+```
+
+### Example `meta_json`
+
 ```json
 {
-  "transfer_function": {
-    "labels": {
-      "0": {"name": "background", "color": [0.0, 0.0, 0.0], "alpha": 0.0},
-      "1": {"name": "tissue_gray", "color": [0.8, 0.8, 0.8], "alpha": 0.1},
-      "2": {"name": "tissue_green", "color": [0.0, 1.0, 0.0], "alpha": 0.4},
-      "3": {"name": "tissue_blue", "color": [0.0, 0.0, 1.0], "alpha": 0.5},
-      "4": {"name": "tissue_yellow", "color": [1.0, 1.0, 0.0], "alpha": 1.0}
-    }
-  }
+  "dim": [240, 240, 155],
+  "spacing_mm": [1.0, 1.0, 1.0],
+  "dtype": "float32",
+  "mode": "anatomy_label_weighted",
+  "channels": 2,
+  "channel_meaning": ["labelmap", "weight01"],
+  "intensity_range": [0.0, 1.0],
+  "affine": [
+    [1.0,0.0,0.0,-120.0],
+    [0.0,1.0,0.0,-120.0],
+    [0.0,0.0,1.0,-75.0],
+    [0.0,0.0,0.0,1.0]
+  ],
+  "order": "x-fast,y-then,z-outer",
+  "endianness": "little"
 }
 ```
 
-You can use the same config for both `--mode labelmap` and `--mode multi_label_channels`.
+### Example `tf_json`
+
+```json
+{
+  "type": "labelmap",
+  "entries": [
+    {"label": 0, "name": "Background", "color": [0,0,0], "alpha": 0.0},
+    {"label": 1, "name": "Enhancing Tumor", "color": [1,0,0], "alpha": 0.4},
+    {"label": 2, "name": "Core Tumor", "color": [0,1,0], "alpha": 0.5},
+    {"label": 3, "name": "Edema", "color": [0,0,1], "alpha": 0.4}
+  ],
+  "origin": "labelmap_weighted4d_default"
+}
+```
 
 ---
 
-### 5️Inspect a `.vrdf` file (Python)
+## Unity Pipeline
 
-Use the provided tool:
+### 1. Place the files
+Put `.vrdf` files into:
+```text
+Assets/StreamingAssets/
+```
+Examples:
+- `scene_lw.vrdf` (fused label+weight)
+- `scene_labels.vrdf` and `scene_weights.vrdf` (split mode)
+- `t2_flair_t00.vrdf`, `t2_flair_t01.vrdf` (continuous4d)
+- `scene_ch0.vrdf`, `scene_ch1.vrdf` (multi_overlay4d)
+
+### 2. Scene setup
+- Create a cube with a `MeshRenderer`
+- Assign a `Material` using `VolumeDVR.shader`
+- Add the `VolumeDVR.cs` component and configure:
+  - `vrdfFusedFileName = "scene_lw.vrdf"` for fused mode
+  - Or fill `vrdfLabelsFileName` / `vrdfWeightsFileName` for split mode
+
+### 3. Runtime behavior
+`VolumeDVR` uses `VRDFLoader.LoadFromFileSmart()` to parse `.vrdf` files:  
+- Reads magic header `VRDF0001`
+- Parses JSON blocks (`meta`, `tf`)
+- Builds GPU textures:
+  - Label texture (`Texture3D`, point filter)
+  - Weight texture (`Texture3D`, bilinear filter)
+  - 1D LUT (`Texture2D`) for colors/alpha
+  - `_LabelCtrlTex` (256×1 RGBAFloat) for dynamic UI control
+
+Injected shader uniforms:
+```
+_VolumeTexLabels
+_VolumeTexWeights
+_HasWeights
+_TFTex
+_LabelCtrlTex
+```
+Plus affine matrices and volume dimensions.
+
+Result:  
+- Real-time 3D raymarched volume rendering  
+- Weight map drives transparency  
+- Fully dynamic per-label color and visibility
+
+### 4. Runtime Label Control API
+```csharp
+SetLabelVisible(int labelIndex, bool visible);
+SetLabelOpacity(int labelIndex, float alpha01);
+SetLabelTint(int labelIndex, Color tintRGB);
+SoloLabel(int labelIndex);
+ShowAll();
+```
+
+You can also query the TF labels dynamically:
+```csharp
+List<VolumeLabelInfoRuntime> infos = volumeDVR.GetLabelInfoList();
+```
+
+Each label entry provides:
+- `labelIndex`
+- `displayName`
+- `color`
+- `defaultVisible`
+
+Perfect for dynamic medical or research visualization UIs.
+
+---
+
+## Python Inspection
+
+To verify or debug a `.vrdf` export:
 
 ```bash
-python read_vrdf.py brain_scene.vrdf
+python read_vrdf.py scene_lw.vrdf
 ```
 
-It prints:
-
+Output example:
 ```
-[OK] Parsed brain_scene.vrdf
+[OK] Parsed scene_lw.vrdf
   Magic: VRDF0001
-  Total size: 247.5 MB
-  Volume: 240×240×155
-  Mode: multi_label_channels
-  Labels:
-    0 → background
-    1 → tissue_gray
-    2 → tissue_green
-    3 → tissue_blue
-    4 → tissue_yellow
+  Mode: anatomy_label_weighted
+  Dim: 240x240x155
+  Channels: 2 (labelmap, weight01)
+  TransferFunction: labelmap (per-label RGBA)
+  Labels present: [0,1,2,3,4]
 ```
-
-You can also visualize a slice if `matplotlib` is installed.
-
----
-
-### 6️Load and Render in Unity
-
-1. Place your `.vrdf` file in:
-   ```
-   Assets/StreamingAssets/
-   ```
-2. Add:
-   - `VolumeVRDFLoader.cs`
-   - `VolumeDVR.shader`
-3. Assign the filename in the inspector.
-
-Unity automatically:
-- Parses metadata and TF JSON  
-- Builds a `3D Texture` from voxels  
-- Creates a `1D LUT` from TF  
-- Performs **real-time raymarching**
-
----
-
-## Example Use Cases
-
-- MRI/CT visualization  
-- Medical segmentation rendering (BraTS, AI masks)  
-- Scientific simulation data  
-- Educational & serious games  
-- 🧑Research visualization pipelines  
 
 ---
 
 ## Roadmap
 
-- [x] `.vrdf` single-file container  
-- [x] Python encoder (NIfTI → VRDF)  
-- [x] Labelmap / Continuous / Multi-channel support  
-- [x] Unity runtime decoder  
-- [ ] C++ reference parser  
-- [ ] WebGL/WebGPU viewer  
-- [ ] ZSTD/LZ4 compression for voxel blocks  
-- [ ] Streaming support for large datasets  
-
----
-
-## Contributing
-
-Pull requests and issues are welcome!  
-You can contribute by:
-- Improving the Python or Unity SDKs  
-- Adding new LUT presets  
-- Extending the `.vrdf` format (compression, streaming, metadata fields)
+- [x] Self-contained `.vrdf` container (voxels + meta + TF)
+- [x] Export modes: `labelmap`, `continuous4d`, `labelmap_weighted4d`, `multi_overlay4d`
+- [x] Unity runtime supports fused `anatomy_label_weighted` mode
+- [ ] C++ reference parser
+- [ ] WebGL/WebGPU viewer
+- [ ] ZSTD / LZ4 voxel block compression
+- [ ] Streaming / bricking for >2GB datasets
+- [ ] Unity UI widgets (label toggles, alpha sliders, clipping planes, etc.)
 
 ---
 
@@ -212,4 +347,4 @@ You can contribute by:
 
 **Apache 2.0 License**  
 © 2025 Guillaume Schneider and contributors.  
-Use freely for research, education, or commercial visualization.
+Free for research, education, prototyping, and industrial visualization.
